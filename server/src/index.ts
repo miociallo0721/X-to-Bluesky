@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { initDb } from './db.js';
 import { router } from './routes.js';
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
@@ -29,6 +30,8 @@ app.get('*', (req, res, next) => {
     }
   });
 });
+
+await initDb();
 
 app.listen(port, () => {
   console.log(`X to Bluesky 服务已启动: http://localhost:${port}`);

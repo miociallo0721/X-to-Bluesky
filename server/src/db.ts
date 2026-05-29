@@ -1,26 +1,101 @@
-import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
 import type { Stats, TweetRecord, TweetStatus } from './types.js';
 
+type SqlParam = string | number | null;
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.join(__dirname, '..', 'data', 'sync.db');
+const DEFAULT_DB_PATH = path.join(__dirname, '..', 'data', 'sync.db');
 
-let db: Database.Database;
+let SQL: SqlJsStatic | null = null;
+let db: Database | null = null;
+let activeDbPath: string | null = null;
 
-export function getDb(): Database.Database {
+function getDbPath(): string {
+  return process.env.X_TO_BSKY_DB_PATH || DEFAULT_DB_PATH;
+}
+
+function ensureInitialized(): Database {
   if (!db) {
-    const dir = path.dirname(DB_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    initSchema(db);
+    throw new Error('数据库尚未初始化，请先调用 initDb()。');
   }
   return db;
 }
 
-function initSchema(database: Database.Database): void {
+function persistDb(): void {
+  const database = ensureInitialized();
+  const dbPath = activeDbPath ?? getDbPath();
+  const dir = path.dirname(dbPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(dbPath, Buffer.from(database.export()));
+}
+
+function bindParams(stmt: { bind(params: Record<string, SqlParam> | SqlParam[]): boolean }, params?: Record<string, SqlParam> | SqlParam[]): void {
+  if (!params) return;
+  stmt.bind(params);
+}
+
+function queryAll<T extends Record<string, unknown>>(sql: string, params?: Record<string, SqlParam> | SqlParam[]): T[] {
+  const stmt = ensureInitialized().prepare(sql);
+  try {
+    bindParams(stmt, params);
+    const rows: T[] = [];
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject() as T);
+    }
+    return rows;
+  } finally {
+    stmt.free();
+  }
+}
+
+function queryOne<T extends Record<string, unknown>>(sql: string, params?: Record<string, SqlParam> | SqlParam[]): T | null {
+  return queryAll<T>(sql, params)[0] ?? null;
+}
+
+function execute(sql: string, params?: Record<string, SqlParam> | SqlParam[]): number {
+  const database = ensureInitialized();
+  const before = database.getRowsModified();
+  const stmt = database.prepare(sql);
+  try {
+    bindParams(stmt, params);
+    stmt.step();
+  } finally {
+    stmt.free();
+  }
+  const changes = database.getRowsModified() - before;
+  persistDb();
+  return changes;
+}
+
+export async function initDb(): Promise<void> {
+  const dbPath = getDbPath();
+  if (db && activeDbPath === dbPath) return;
+
+  closeDb();
+  SQL ??= await initSqlJs();
+
+  const dir = path.dirname(dbPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  const data = fs.existsSync(dbPath) ? fs.readFileSync(dbPath) : undefined;
+  db = data ? new SQL.Database(data) : new SQL.Database();
+  activeDbPath = dbPath;
+  initSchema(db);
+  persistDb();
+}
+
+export function closeDb(): void {
+  if (db) {
+    db.close();
+    db = null;
+    activeDbPath = null;
+  }
+}
+
+function initSchema(database: Database): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS tweets (
       id TEXT PRIMARY KEY,
@@ -53,35 +128,28 @@ function initSchema(database: Database.Database): void {
 }
 
 export function upsertTweets(tweets: Omit<TweetRecord, 'status' | 'bsky_uri' | 'error_message' | 'synced_at'>[]): number {
-  const database = getDb();
-  const stmt = database.prepare(`
-    INSERT INTO tweets (id, text, created_at, is_retweet, is_reply, media_urls)
-    VALUES (@id, @text, @created_at, @is_retweet, @is_reply, @media_urls)
-    ON CONFLICT(id) DO UPDATE SET
-      text = excluded.text,
-      created_at = excluded.created_at,
-      is_retweet = excluded.is_retweet,
-      is_reply = excluded.is_reply,
-      media_urls = excluded.media_urls
-    WHERE tweets.status = 'pending' OR tweets.status = 'failed'
-  `);
-
   let inserted = 0;
-  const tx = database.transaction(() => {
-    for (const t of tweets) {
-      const before = database.prepare('SELECT status FROM tweets WHERE id = ?').get(t.id) as { status: string } | undefined;
-      const info = stmt.run({
-        id: t.id,
-        text: t.text,
-        created_at: t.created_at,
-        is_retweet: t.is_retweet ? 1 : 0,
-        is_reply: t.is_reply ? 1 : 0,
-        media_urls: t.media_urls,
-      });
-      if (info.changes > 0 && !before) inserted++;
-    }
-  });
-  tx();
+
+  for (const t of tweets) {
+    const before = queryOne<{ status: string }>('SELECT status FROM tweets WHERE id = ?', [t.id]);
+    const changes = execute(
+      `
+        INSERT INTO tweets (id, text, created_at, is_retweet, is_reply, media_urls)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          text = excluded.text,
+          created_at = excluded.created_at,
+          is_retweet = excluded.is_retweet,
+          is_reply = excluded.is_reply,
+          media_urls = excluded.media_urls
+        WHERE tweets.status = 'pending' OR tweets.status = 'failed'
+      `,
+      [t.id, t.text, t.created_at, t.is_retweet ? 1 : 0, t.is_reply ? 1 : 0, t.media_urls]
+    );
+
+    if (changes > 0 && !before) inserted++;
+  }
+
   return inserted;
 }
 
@@ -94,9 +162,9 @@ function rowToTweet(row: Record<string, unknown>): TweetRecord {
     is_reply: Boolean(row.is_reply),
     media_urls: row.media_urls as string,
     status: row.status as TweetStatus,
-    bsky_uri: (row.bsky_uri as string) ?? null,
-    error_message: (row.error_message as string) ?? null,
-    synced_at: (row.synced_at as string) ?? null,
+    bsky_uri: (row.bsky_uri as string | undefined) ?? null,
+    error_message: (row.error_message as string | undefined) ?? null,
+    synced_at: (row.synced_at as string | undefined) ?? null,
   };
 }
 
@@ -106,43 +174,35 @@ export function listTweets(opts: {
   offset?: number;
   search?: string;
 }): { tweets: TweetRecord[]; total: number } {
-  const database = getDb();
   const conditions: string[] = [];
-  const params: Record<string, string | number> = {};
+  const params: SqlParam[] = [];
 
   if (opts.status) {
-    conditions.push('status = @status');
-    params.status = opts.status;
+    conditions.push('status = ?');
+    params.push(opts.status);
   }
   if (opts.search) {
-    conditions.push('text LIKE @search');
-    params.search = `%${opts.search}%`;
+    conditions.push('text LIKE ?');
+    params.push(`%${opts.search}%`);
   }
 
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-  const total = (database.prepare(`SELECT COUNT(*) as c FROM tweets ${where}`).get(params) as { c: number }).c;
-
-  const limit = opts.limit ?? 50;
-  const offset = opts.offset ?? 0;
-  const rows = database
-    .prepare(`SELECT * FROM tweets ${where} ORDER BY created_at ASC LIMIT @limit OFFSET @offset`)
-    .all({ ...params, limit, offset }) as Record<string, unknown>[];
+  const total = queryOne<{ c: number }>(`SELECT COUNT(*) as c FROM tweets ${where}`, params)?.c ?? 0;
+  const rows = queryAll<Record<string, unknown>>(
+    `SELECT * FROM tweets ${where} ORDER BY created_at ASC LIMIT ? OFFSET ?`,
+    [...params, opts.limit ?? 50, opts.offset ?? 0]
+  );
 
   return { tweets: rows.map(rowToTweet), total };
 }
 
 export function getStats(): Stats {
-  const database = getDb();
-  const rows = database
-    .prepare(`SELECT status, COUNT(*) as c FROM tweets GROUP BY status`)
-    .all() as { status: string; c: number }[];
-
+  const rows = queryAll<{ status: string; c: number }>('SELECT status, COUNT(*) as c FROM tweets GROUP BY status');
   const stats: Stats = { total: 0, pending: 0, success: 0, failed: 0, skipped: 0 };
+
   for (const r of rows) {
-    if (r.status === 'syncing') {
+    if (r.status === 'syncing' || r.status === 'pending') {
       stats.pending += r.c;
-    } else if (r.status === 'pending') {
-      stats.pending = r.c;
     } else if (r.status === 'success') {
       stats.success = r.c;
     } else if (r.status === 'failed') {
@@ -152,6 +212,7 @@ export function getStats(): Stats {
     }
     stats.total += r.c;
   }
+
   return stats;
 }
 
@@ -160,74 +221,78 @@ export function updateTweetStatus(
   status: TweetStatus,
   extra?: { bsky_uri?: string; error_message?: string }
 ): void {
-  const database = getDb();
-  database
-    .prepare(
-      `UPDATE tweets SET status = @status, bsky_uri = COALESCE(@bsky_uri, bsky_uri),
-       error_message = @error_message, synced_at = CASE WHEN @status = 'success' THEN datetime('now') ELSE synced_at END
-       WHERE id = @id`
-    )
-    .run({
-      id,
-      status,
-      bsky_uri: extra?.bsky_uri ?? null,
-      error_message: extra?.error_message ?? null,
-    });
+  execute(
+    `UPDATE tweets SET status = ?, bsky_uri = COALESCE(?, bsky_uri),
+     error_message = ?, synced_at = CASE WHEN ? = 'success' THEN datetime('now') ELSE synced_at END
+     WHERE id = ?`,
+    [status, extra?.bsky_uri ?? null, extra?.error_message ?? null, status, id]
+  );
 }
 
 export function getNextPendingTweet(skipRetweets: boolean, skipReplies: boolean): TweetRecord | null {
-  const database = getDb();
   const conditions = ["status = 'pending'"];
   if (skipRetweets) conditions.push('is_retweet = 0');
   if (skipReplies) conditions.push('is_reply = 0');
 
-  const row = database
-    .prepare(`SELECT * FROM tweets WHERE ${conditions.join(' AND ')} ORDER BY created_at ASC LIMIT 1`)
-    .get() as Record<string, unknown> | undefined;
+  const row = queryOne<Record<string, unknown>>(
+    `SELECT * FROM tweets WHERE ${conditions.join(' AND ')} ORDER BY created_at ASC LIMIT 1`
+  );
 
   return row ? rowToTweet(row) : null;
 }
 
+export function skipPendingTweetsByPolicy(skipRetweets: boolean, skipReplies: boolean): number {
+  const skipConditions: string[] = [];
+  if (skipRetweets) skipConditions.push('is_retweet = 1');
+  if (skipReplies) skipConditions.push('is_reply = 1');
+  if (skipConditions.length === 0) return 0;
+
+  return execute(
+    `UPDATE tweets
+     SET status = 'skipped', error_message = NULL
+     WHERE status = 'pending' AND (${skipConditions.join(' OR ')})`
+  );
+}
+
 export function resetFailedToPending(): number {
-  const database = getDb();
-  const info = database.prepare(`UPDATE tweets SET status = 'pending', error_message = NULL WHERE status = 'failed'`).run();
-  return info.changes;
+  return execute(`UPDATE tweets SET status = 'pending', error_message = NULL WHERE status = 'failed'`);
 }
 
 export function resetSyncingToPending(): number {
-  const database = getDb();
-  const info = database
-    .prepare(`UPDATE tweets SET status = 'pending', error_message = NULL WHERE status = 'syncing'`)
-    .run();
-  return info.changes;
+  return execute(`UPDATE tweets SET status = 'pending', error_message = NULL WHERE status = 'syncing'`);
 }
 
 export function clearAllTweets(): void {
-  getDb().prepare('DELETE FROM tweets').run();
+  execute('DELETE FROM tweets');
 }
 
 export function setConfig(key: string, value: string): void {
-  getDb().prepare('INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
+  execute('INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', [
+    key,
+    value,
+  ]);
 }
 
 export function getConfig(key: string): string | null {
-  const row = getDb().prepare('SELECT value FROM config WHERE key = ?').get(key) as { value: string } | undefined;
+  const row = queryOne<{ value: string }>('SELECT value FROM config WHERE key = ?', [key]);
   return row?.value ?? null;
 }
 
 export function getAllConfig(): Record<string, string> {
-  const rows = getDb().prepare('SELECT key, value FROM config').all() as { key: string; value: string }[];
+  const rows = queryAll<{ key: string; value: string }>('SELECT key, value FROM config');
   return Object.fromEntries(rows.map((r) => [r.key, r.value]));
 }
 
 export function addLog(level: string, message: string, tweetId?: string): void {
-  getDb()
-    .prepare('INSERT INTO sync_log (level, message, tweet_id) VALUES (?, ?, ?)')
-    .run(level, message, tweetId ?? null);
+  execute('INSERT INTO sync_log (level, message, tweet_id) VALUES (?, ?, ?)', [level, message, tweetId ?? null]);
 }
 
 export function getLogs(limit = 100): { id: number; level: string; message: string; tweet_id: string | null; created_at: string }[] {
-  return getDb()
-    .prepare('SELECT * FROM sync_log ORDER BY id DESC LIMIT ?')
-    .all(limit) as { id: number; level: string; message: string; tweet_id: string | null; created_at: string }[];
+  return queryAll('SELECT * FROM sync_log ORDER BY id DESC LIMIT ?', [limit]) as {
+    id: number;
+    level: string;
+    message: string;
+    tweet_id: string | null;
+    created_at: string;
+  }[];
 }

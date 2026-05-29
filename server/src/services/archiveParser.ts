@@ -62,8 +62,20 @@ function parseArchiveTweets(data: unknown): RawTweet[] {
 }
 
 export function parseArchiveJson(buffer: Buffer): RawTweet[] {
-  const data = JSON.parse(buffer.toString('utf-8'));
-  return parseArchiveTweets(data);
+  let content = buffer.toString('utf-8').trim();
+  const match = content.match(/=\s*(\[[\s\S]*\])\s*;?\s*$/);
+  if (match) {
+    content = match[1];
+  } else {
+    content = content.replace(/^window\.YTD\.\w+\s*=\s*/, '').replace(/;\s*$/, '');
+  }
+
+  const parsed = JSON.parse(content);
+  const tweetArray = Array.isArray(parsed)
+    ? parsed.map((item: { tweet?: ArchiveTweet }) => item.tweet ?? item)
+    : parsed;
+
+  return parseArchiveTweets(tweetArray);
 }
 
 export function parseArchiveZip(buffer: Buffer): RawTweet[] {
@@ -88,12 +100,7 @@ export function parseArchiveZip(buffer: Buffer): RawTweet[] {
     content = content.replace(/^window\.YTD\.\w+\s*=\s*/, '').replace(/;\s*$/, '');
   }
 
-  const parsed = JSON.parse(content);
-  const tweetArray = Array.isArray(parsed)
-    ? parsed.map((item: { tweet?: ArchiveTweet }) => item.tweet ?? item)
-    : parsed;
-
-  return parseArchiveTweets(tweetArray);
+  return parseArchiveJson(Buffer.from(content, 'utf-8'));
 }
 
 export function parseArchiveFile(filePath: string): RawTweet[] {
