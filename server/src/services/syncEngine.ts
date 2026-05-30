@@ -74,8 +74,17 @@ export async function startSync(config: AppConfig, settings: SyncSettings): Prom
   db.addLog('info', `开始同步（dryRun=${settings.dryRun}）。`);
 
   try {
-    await loginBsky(config);
-    db.addLog('success', 'Bluesky 登录成功。');
+    const skipped = db.skipPendingTweetsByPolicy(settings.skipRetweets, settings.skipReplies);
+    if (skipped > 0) {
+      db.addLog('info', `根据同步策略跳过了 ${skipped} 条推文。`);
+    }
+
+    if (!settings.dryRun) {
+      await loginBsky(config);
+      db.addLog('success', 'Bluesky 登录成功。');
+    } else {
+      db.addLog('info', '试运行模式：不会登录 Bluesky 或实际发帖。');
+    }
 
     while (!abortRequested) {
       if (state.paused) {

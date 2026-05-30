@@ -46,17 +46,18 @@ export async function postToBsky(
   text: string,
   options: { addSourceTag: boolean; dryRun: boolean }
 ): Promise<{ uri: string; cid: string } | { dryRun: true }> {
-  if (!agent) {
-    throw new Error('请先登录 Bluesky。');
-  }
-
   const body = truncateForBsky(text, options.addSourceTag);
-  const richText = new RichText({ text: body });
-  await richText.detectFacets(agent);
 
   if (options.dryRun) {
     return { dryRun: true };
   }
+
+  if (!agent) {
+    throw new Error('请先登录 Bluesky。');
+  }
+
+  const richText = new RichText({ text: body });
+  await richText.detectFacets(agent);
 
   const result = await agent.post({
     text: richText.text,
