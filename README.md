@@ -1,116 +1,138 @@
-# X to Bluesky 同步工具
+# X-to-Bluesky
 
-把你在 X（Twitter）上的推文整理后迁移到 Bluesky，并提供一个本地可视化控制台来管理导入、测试和同步过程。
+`X-to-Bluesky` is a migration tool for moving tweet history from X (Twitter) to Bluesky.
 
-## 当前能力
+This repository now has two usable directions:
 
-- 支持两种数据来源
-  - 使用 X API 拉取最近推文
-  - 导入 X 官方数据归档 `.zip` / `.json`
-- 提供本地控制面板
-  - 查看统计、推文列表、运行日志和同步状态
-  - 支持开始、暂停、继续、停止同步
-- 支持同步策略配置
-  - 跳过转推
-  - 跳过回复
-  - 试运行模式
-  - 发帖间隔控制
-  - 可选来源标记
-- 使用 SQLite 持久化状态
-  - 记录每条推文的同步结果
-  - 支持失败重试
+- A legacy web/server workflow for desktop-style local use
+- A newer Android single-APK path that embeds more of the runtime directly inside the app
 
-## 使用前准备
+At this stage, the Android path is the main long-term direction.
 
-### 1. Bluesky App Password
+## What it can do
 
-在 [Bluesky 设置](https://bsky.app/settings/app-passwords) 中创建一个 App Password。
+- Import tweet history from:
+  - X API
+  - X official archive export (`.zip`, `.json`, `tweets.js`)
+- Manage tweet migration progress from a visual interface
+- Configure sync policies:
+  - skip retweets
+  - skip replies
+  - dry run
+  - delay between posts
+  - optional source tag
+- Post migrated content to Bluesky
+- Track status, logs, retry state, and sync progress
 
-### 2. X API 凭证（可选）
+## Repository layout
 
-如果你想直接从 API 拉取最近推文，需要准备：
+```text
+x-to-bsky/
++-- client/          # React UI
++-- server/          # Legacy Express/server path
++-- mobile/          # Capacitor Android app
++-- packages/core/   # Shared migration and sync logic
+\-- docs/            # Android and architecture documentation
+```
 
-- X Bearer Token
-- X User ID
+## Current recommended path
 
-可以在 [X Developer Portal](https://developer.x.com/) 申请相关凭证。免费额度通常只能覆盖最近一部分推文历史。
+If your goal is the Android app, start with:
 
-### 3. X 官方归档（推荐）
+- [mobile/README.md](./mobile/README.md)
 
-如果你想迁移更完整的历史，建议使用 X 官方归档：
+That README describes:
 
-- X 设置
-- 你的账户
-- 下载数据归档
+- the standalone Android app workspace
+- current single-APK architecture
+- build commands
+- APK / AAB output paths
 
-拿到 `.zip` 后直接在面板上传即可。
+## Android app status
 
-## 快速开始
+The Android app is no longer just a thin shell.
+
+It already includes:
+
+- local app state stored on-device
+- secure credential storage bridge
+- archive import from phone files
+- embedded sync orchestration
+- native HTTP access to X and Bluesky
+
+That means the Android path is moving toward a true standalone APK, instead of requiring a separately deployed backend for normal app usage.
+
+## Web / local server workflow
+
+The older desktop-style local workflow still exists for compatibility and development.
+
+Run from the repository root:
 
 ```bash
-cd x-to-bsky
 npm install
 npm run dev
 ```
 
-开发环境默认地址：
+Default local addresses:
 
-- 前端面板：`http://localhost:5173`
-- 后端服务：`http://localhost:3847`
+- frontend: `http://localhost:5173`
+- backend: `http://localhost:3847`
 
-## 生产构建
+Production-style build:
 
 ```bash
 npm run build
 npm start
 ```
 
-启动后访问：
+## Android workflow
 
-- `http://localhost:3847`
+Useful root commands:
 
-## 使用流程
+- `npm.cmd run mobile:sync`
+- `npm.cmd run mobile:android`
+- `npm.cmd run mobile:build:debug`
+- `npm.cmd run mobile:build:release`
+- `npm.cmd run mobile:bundle:release`
 
-1. 填写 Bluesky `Handle` 和 `App Password`
-2. 点击“测试登录”确认 Bluesky 凭证可用
-3. 导入推文数据
-   - 推荐上传 X 官方归档
-   - 或填写 X API 信息后从 API 拉取
-4. 调整同步策略
-5. 保存配置并开始同步
+For release signing and store packaging, see:
 
-## 环境变量
+- [docs/android-release-guide.md](./docs/android-release-guide.md)
 
-你可以在 `server/.env` 中预填默认配置：
+For Android workspace notes, see:
 
-```env
-PORT=3847
-X_BEARER_TOKEN=
-X_USER_ID=
-BSKY_HANDLE=yourname.bsky.social
-BSKY_APP_PASSWORD=
-```
+- [docs/android-shell-setup.md](./docs/android-shell-setup.md)
 
-## 项目结构
+## Credentials you may need
 
-```text
-x-to-bsky/
-├─ client/          # React 控制台
-├─ server/          # Express API + 同步引擎
-│  ├─ src/
-│  └─ data/         # SQLite 数据文件（运行后生成）
-└─ package.json
-```
+### Bluesky
 
-## 当前限制
+Create an App Password in Bluesky settings:
 
-- 目前仅同步文本内容，不上传图片或视频
-- 不会自动重建 X 的回复链为 Bluesky 线程
-- 长文会按 Bluesky 文本长度限制截断
-- 默认发帖间隔为 3 秒，用于降低限流风险
+- [Bluesky App Passwords](https://bsky.app/settings/app-passwords)
 
-## 安全提示
+### X API
 
-- 凭证保存在本地 SQLite 中，不要提交 `server/data/`
-- 建议使用 Bluesky App Password，不要使用主密码
-- 本工具默认在本地运行，不会额外把你的凭证发送到第三方服务
+If you want to fetch recent tweets from X API, prepare:
+
+- X Bearer Token
+- X User ID
+
+You can get these through:
+
+- [X Developer Portal](https://developer.x.com/)
+
+If you want more complete history, the official X archive export is recommended instead.
+
+## Current limitations
+
+- Media upload is still limited compared with a fully native migration pipeline
+- Thread reconstruction is not fully rebuilt as Bluesky conversation structure
+- Some Android background behavior is still being hardened
+- The repo still contains both legacy and new architecture paths during the transition period
+
+## Security notes
+
+- Use a Bluesky App Password instead of your main password
+- Do not commit keystores or private credentials
+- The Android path stores sensitive values through the native secure storage bridge
