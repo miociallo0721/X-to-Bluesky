@@ -48,7 +48,7 @@ Run these from the repository root:
 - Debug APK
   - `mobile/android/app/build/outputs/apk/debug/app-debug.apk`
 - Release APK
-  - `mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk`
+  - `mobile/android/app/build/outputs/apk/release/app-release.apk`
 - Release App Bundle
   - `mobile/android/app/build/outputs/bundle/release/app-release.aab`
 

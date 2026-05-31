@@ -10,6 +10,7 @@ This project can now produce both debug and release Android builds from the `mob
   - `platforms;android-36`
   - `build-tools;35.0.0` or newer
 - A release keystore when building signed production packages
+- `mobile/android/local.properties` pointing to your local Android SDK if `ANDROID_HOME` is not set
 
 ## Build commands
 
@@ -55,6 +56,12 @@ keytool -genkeypair -v `
 ```
 
 Run it inside `mobile/android` so the default `storeFile=release-keystore.jks` works directly.
+
+If your keystore is stored one directory above the app module, set:
+
+```properties
+storeFile=../release-keystore.jks
+```
 
 ## Versioning
 
