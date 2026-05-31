@@ -1,72 +1,54 @@
 import { Router } from 'express';
 import multer from 'multer';
-import * as db from './db.js';
+import {
+  loadSettingsFromStore,
+  maskConfig,
+  mergeAppConfig,
+  sanitizeConfigUpdate,
+  sanitizeSettingsUpdate,
+  serializeImportedTweets,
+  splitConfigBySensitivity,
+} from '../../packages/core/src/index.js';
 import type { AppConfig, SyncSettings, TweetStatus } from './types.js';
-import { parseArchiveJson, parseArchiveZip } from './services/archiveParser.js';
+import { sqliteCredentialStore } from './credentials.js';
 import { loginBsky, resetBskySession } from './services/bskyClient.js';
+import { parseArchiveJson, parseArchiveZip } from './services/archiveParser.js';
 import * as syncEngine from './services/syncEngine.js';
 import { fetchTweetsFromApi, lookupUserId } from './services/xClient.js';
+import { sqliteStore } from './store.js';
+import { taskRunner } from './taskRunner.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
-const SECRET_MASK_PREFIX = '********';
 
 export const router = Router();
 
-function maskSecret(value: string): string {
-  return `${SECRET_MASK_PREFIX}${value.slice(-4)}`;
-}
-
-function isMaskedSecret(value: string): boolean {
-  return value.startsWith(SECRET_MASK_PREFIX);
-}
-
-function maskConfig(config: AppConfig): AppConfig {
-  return {
-    ...config,
-    xBearerToken: config.xBearerToken ? maskSecret(config.xBearerToken) : '',
-    bskyAppPassword: config.bskyAppPassword ? maskSecret(config.bskyAppPassword) : '',
-  };
-}
-
 function loadAppConfig(): AppConfig {
-  const saved = db.getAllConfig();
-  return {
-    xBearerToken: saved.xBearerToken ?? process.env.X_BEARER_TOKEN ?? '',
-    xUserId: saved.xUserId ?? process.env.X_USER_ID ?? '',
-    bskyHandle: saved.bskyHandle ?? process.env.BSKY_HANDLE ?? '',
-    bskyAppPassword: saved.bskyAppPassword ?? process.env.BSKY_APP_PASSWORD ?? '',
-  };
+  const config = sqliteStore.getAllConfig();
+  const credentials = sqliteCredentialStore.getCredentials();
+  return mergeAppConfig(config, credentials, process.env);
 }
 
 function loadSyncSettings(): SyncSettings {
-  const saved = db.getAllConfig();
-  return {
-    skipRetweets: saved.skipRetweets !== 'false',
-    skipReplies: saved.skipReplies === 'true',
-    dryRun: saved.dryRun === 'true',
-    delayMs: Number(saved.delayMs) || 3000,
-    addSourceTag: saved.addSourceTag !== 'false',
-  };
+  return loadSettingsFromStore(sqliteStore);
 }
 
 function persistConfig(config?: Partial<AppConfig>): void {
-  if (!config) return;
+  const current = loadAppConfig();
+  const sanitized = sanitizeConfigUpdate(config, current);
+  const { config: nextConfig, credentials } = splitConfigBySensitivity(sanitized);
 
-  for (const [key, rawValue] of Object.entries(config)) {
-    const value = String(rawValue ?? '');
-    if ((key === 'xBearerToken' || key === 'bskyAppPassword') && isMaskedSecret(value)) {
-      continue;
-    }
-    db.setConfig(key, value.trim());
+  for (const [key, value] of Object.entries(nextConfig)) {
+    sqliteStore.setConfig(key, String(value));
   }
+
+  sqliteCredentialStore.setCredentials(credentials);
 }
 
 function persistSettings(settings?: Partial<SyncSettings>): void {
-  if (!settings) return;
+  const nextSettings = sanitizeSettingsUpdate(settings);
 
-  for (const [key, value] of Object.entries(settings)) {
-    if (typeof value === 'undefined') continue;
-    db.setConfig(key, String(value));
+  for (const [key, value] of Object.entries(nextSettings)) {
+    sqliteStore.setConfig(key, value);
   }
 }
 
@@ -100,7 +82,7 @@ router.post('/api/x/lookup-user', async (req, res) => {
     }
 
     const userId = await lookupUserId(username, token);
-    db.setConfig('xUserId', userId);
+    sqliteStore.setConfig('xUserId', userId);
     res.json({ userId });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -110,15 +92,10 @@ router.post('/api/x/lookup-user', async (req, res) => {
 router.post('/api/x/fetch', async (_req, res) => {
   try {
     const tweets = await fetchTweetsFromApi(loadAppConfig());
-    const count = db.upsertTweets(
-      tweets.map((tweet) => ({
-        ...tweet,
-        media_urls: JSON.stringify(tweet.media_urls),
-      }))
-    );
+    const count = sqliteStore.upsertTweets(serializeImportedTweets(tweets));
 
-    db.addLog('info', `从 X API 导入了 ${tweets.length} 条推文，其中新增 ${count} 条。`);
-    res.json({ imported: tweets.length, newCount: count, stats: db.getStats() });
+    sqliteStore.addLog('info', `从 X API 导入了 ${tweets.length} 条推文，其中新增 ${count} 条。`);
+    res.json({ imported: tweets.length, newCount: count, stats: sqliteStore.getStats() });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -136,15 +113,10 @@ router.post('/api/x/import-archive', upload.single('archive'), (req, res) => {
         ? parseArchiveZip(req.file.buffer)
         : parseArchiveJson(req.file.buffer);
 
-    const count = db.upsertTweets(
-      tweets.map((tweet) => ({
-        ...tweet,
-        media_urls: JSON.stringify(tweet.media_urls),
-      }))
-    );
+    const count = sqliteStore.upsertTweets(serializeImportedTweets(tweets));
 
-    db.addLog('info', `从归档中导入了 ${tweets.length} 条推文，其中新增 ${count} 条。`);
-    res.json({ imported: tweets.length, newCount: count, stats: db.getStats() });
+    sqliteStore.addLog('info', `从归档中导入了 ${tweets.length} 条推文，其中新增 ${count} 条。`);
+    res.json({ imported: tweets.length, newCount: count, stats: sqliteStore.getStats() });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -157,7 +129,7 @@ router.get('/api/tweets', (req, res) => {
   const offset = Number(req.query.offset) || 0;
 
   res.json(
-    db.listTweets({
+    sqliteStore.listTweets({
       status,
       search,
       limit,
@@ -167,12 +139,12 @@ router.get('/api/tweets', (req, res) => {
 });
 
 router.get('/api/stats', (_req, res) => {
-  res.json({ stats: db.getStats(), engine: syncEngine.getEngineState() });
+  res.json({ stats: sqliteStore.getStats(), engine: syncEngine.getEngineState() });
 });
 
 router.get('/api/logs', (req, res) => {
   const limit = Number(req.query.limit) || 100;
-  res.json({ logs: db.getLogs(limit) });
+  res.json({ logs: sqliteStore.getLogs(limit) });
 });
 
 router.post('/api/bsky/test-login', async (_req, res) => {
@@ -190,7 +162,7 @@ router.post('/api/sync/start', (_req, res) => {
     return;
   }
 
-  void syncEngine.startSync(loadAppConfig(), loadSyncSettings());
+  void taskRunner.run('sync.start', () => syncEngine.startSync(loadAppConfig(), loadSyncSettings()));
   res.json({ ok: true, message: '同步已启动。' });
 });
 
@@ -210,7 +182,7 @@ router.post('/api/sync/stop', (_req, res) => {
 });
 
 router.post('/api/tweets/reset-failed', (_req, res) => {
-  const count = db.resetFailedToPending();
+  const count = sqliteStore.resetFailedToPending();
   res.json({ reset: count });
 });
 
@@ -220,7 +192,7 @@ router.delete('/api/tweets', (_req, res) => {
     return;
   }
 
-  db.clearAllTweets();
-  db.addLog('info', '已清空所有推文记录。');
+  sqliteStore.clearAllTweets();
+  sqliteStore.addLog('info', '已清空所有推文记录。');
   res.json({ ok: true });
 });

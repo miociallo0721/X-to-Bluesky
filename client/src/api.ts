@@ -1,7 +1,26 @@
-const BASE = '';
+import { embeddedApi } from './embeddedApi';
+
+const envBase = (import.meta.env.VITE_API_BASE_URL ?? '').trim();
+let runtimeBase = '';
+
+function normalizeBaseUrl(value: string): string {
+  return value.trim().replace(/\/$/, '');
+}
+
+export function setApiBaseUrl(value: string): void {
+  runtimeBase = normalizeBaseUrl(value);
+}
+
+function getBaseUrl(): string {
+  return runtimeBase || normalizeBaseUrl(envBase);
+}
+
+function resolveUrl(path: string): string {
+  return `${getBaseUrl()}${path}`;
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, options);
+  const res = await fetch(resolveUrl(path), options);
   const data = (await res.json()) as { error?: string };
   if (!res.ok) {
     throw new Error(data.error ?? res.statusText);
@@ -58,7 +77,7 @@ export interface ConfigResponse {
   settings: SyncSettings;
 }
 
-export const api = {
+const remoteApi = {
   getConfig: () => request<ConfigResponse>('/api/config'),
   saveConfig: (body: { config?: Partial<AppConfig>; settings?: Partial<SyncSettings> }) =>
     request<ConfigResponse>('/api/config', {
@@ -76,7 +95,7 @@ export const api = {
   importArchive: async (file: File) => {
     const formData = new FormData();
     formData.append('archive', file);
-    const res = await fetch('/api/x/import-archive', { method: 'POST', body: formData });
+    const res = await fetch(resolveUrl('/api/x/import-archive'), { method: 'POST', body: formData });
     const data = (await res.json()) as { error?: string; imported: number; newCount: number; stats: Stats };
     if (!res.ok) {
       throw new Error(data.error ?? '导入归档失败。');
@@ -100,4 +119,7 @@ export const api = {
   stopSync: () => request<{ ok: true }>('/api/sync/stop', { method: 'POST' }),
   resetFailed: () => request<{ reset: number }>('/api/tweets/reset-failed', { method: 'POST' }),
   clearTweets: () => request<{ ok: true }>('/api/tweets', { method: 'DELETE' }),
+  clearLocalCredentials: async () => {},
 };
+
+export const api = embeddedApi.isEnabled() ? embeddedApi : remoteApi;

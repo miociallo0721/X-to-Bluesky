@@ -1,13 +1,7 @@
 import type { AppConfig } from '../types.js';
+import type { ImportedTweet } from '../../../packages/core/src/index.js';
 
-export interface RawTweet {
-  id: string;
-  text: string;
-  created_at: string;
-  is_retweet: boolean;
-  is_reply: boolean;
-  media_urls: string[];
-}
+export type RawTweet = ImportedTweet;
 
 interface XApiTweet {
   id: string;

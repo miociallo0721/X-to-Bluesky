@@ -1,20 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import initSqlJs, { type Database, type SqlJsStatic } from 'sql.js';
+import { getDefaultDbPath } from './paths.js';
 import type { Stats, TweetRecord, TweetStatus } from './types.js';
 
 type SqlParam = string | number | null;
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_DB_PATH = path.join(__dirname, '..', 'data', 'sync.db');
 
 let SQL: SqlJsStatic | null = null;
 let db: Database | null = null;
 let activeDbPath: string | null = null;
 
 function getDbPath(): string {
-  return process.env.X_TO_BSKY_DB_PATH || DEFAULT_DB_PATH;
+  return process.env.X_TO_BSKY_DB_PATH || getDefaultDbPath();
 }
 
 function ensureInitialized(): Database {

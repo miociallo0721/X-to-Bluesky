@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, type AppConfig, type EngineState, type Stats, type SyncSettings, type Tweet, type TweetStatus } from './api';
+import {
+  clearSyncStatus,
+  getSecureCredentials,
+  isNativeMobile,
+  notifySyncStatus,
+  pickArchiveFile,
+  setSecureCredentials,
+  startBackgroundSyncMonitor,
+  stopBackgroundSyncMonitor,
+} from './mobile';
 
 const SECRET_MASK_PREFIX = '********';
 
@@ -33,7 +43,7 @@ const defaultEngine: EngineState = {
   startedAt: null,
 };
 
-function formatDate(iso: string) {
+function formatDate(iso: string): string {
   try {
     return new Date(iso).toLocaleString('zh-CN');
   } catch {
@@ -61,6 +71,8 @@ function statusLabel(status: TweetStatus): string {
 }
 
 export default function App() {
+  const mobileMode = isNativeMobile();
+  const embeddedMode = mobileMode && api.isEnabled();
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [settings, setSettings] = useState<SyncSettings>(defaultSettings);
   const [stats, setStats] = useState<Stats>(defaultStats);
@@ -74,6 +86,7 @@ export default function App() {
   const [xUsername, setXUsername] = useState('');
   const [loading, setLoading] = useState('');
   const [configLoaded, setConfigLoaded] = useState(false);
+  const [bootReady, setBootReady] = useState(false);
 
   const showToast = useCallback((msg: string, error = false) => {
     setToast({ msg, error });
@@ -95,7 +108,7 @@ export default function App() {
       setTweetTotal(total);
       setLogs(latestLogs);
     } catch {
-      // The server may still be starting up.
+      // Ignore transient refresh failures.
     }
   }, [filterStatus, search]);
 
@@ -104,10 +117,34 @@ export default function App() {
 
     void api.getConfig().then(({ config: nextConfig, settings: nextSettings }) => {
       if (cancelled) return;
-      setConfig(nextConfig);
-      setSettings(nextSettings);
-      setConfigLoaded(true);
+
+      void (async () => {
+        const secureCredentials = mobileMode
+          ? await getSecureCredentials()
+          : { xBearerToken: '', bskyAppPassword: '' };
+
+        if (cancelled) return;
+
+        setConfig({
+          ...nextConfig,
+          xBearerToken: secureCredentials.xBearerToken || nextConfig.xBearerToken,
+          bskyAppPassword: secureCredentials.bskyAppPassword || nextConfig.bskyAppPassword,
+        });
+        setSettings(nextSettings);
+        setConfigLoaded(true);
+        setBootReady(true);
+      })();
     });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mobileMode]);
+
+  useEffect(() => {
+    if (!bootReady) {
+      return;
+    }
 
     void refresh();
     const timer = window.setInterval(() => {
@@ -115,10 +152,28 @@ export default function App() {
     }, 2000);
 
     return () => {
-      cancelled = true;
       window.clearInterval(timer);
     };
-  }, [refresh]);
+  }, [bootReady, refresh]);
+
+  useEffect(() => {
+    if (!mobileMode) {
+      return;
+    }
+
+    if (engine.running) {
+      void notifySyncStatus({
+        title: engine.paused ? '同步已暂停' : '同步进行中',
+        body: engine.currentTweetId ? `当前推文 ${engine.currentTweetId}` : `待处理 ${stats.pending} 条`,
+        ongoing: !engine.paused,
+      });
+      void startBackgroundSyncMonitor();
+      return;
+    }
+
+    void clearSyncStatus();
+    void stopBackgroundSyncMonitor();
+  }, [engine, mobileMode, stats.pending]);
 
   const progress = useMemo(() => {
     if (stats.total === 0) return 0;
@@ -129,6 +184,7 @@ export default function App() {
     if (stats.total === 0) {
       return '还没有导入任何推文。';
     }
+
     return `当前库中共有 ${stats.total} 条推文，其中 ${stats.pending} 条待处理。`;
   }, [stats]);
 
@@ -136,17 +192,23 @@ export default function App() {
     setLoading('save');
     try {
       const result = await api.saveConfig({ config, settings });
+      if (mobileMode) {
+        await setSecureCredentials({
+          xBearerToken: isMaskedSecret(config.xBearerToken) ? '' : config.xBearerToken,
+          bskyAppPassword: isMaskedSecret(config.bskyAppPassword) ? '' : config.bskyAppPassword,
+        });
+      }
       setConfig(result.config);
       setSettings(result.settings);
       showToast('配置已保存。');
       return true;
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '保存配置失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '保存配置失败。', true);
       return false;
     } finally {
       setLoading('');
     }
-  }, [config, settings, showToast]);
+  }, [config, mobileMode, settings, showToast]);
 
   const lookupUser = async () => {
     if (!xUsername.trim()) {
@@ -160,8 +222,8 @@ export default function App() {
       const { userId } = await api.lookupUser(xUsername, token);
       setConfig((current) => ({ ...current, xUserId: userId }));
       showToast(`已找到用户 ID: ${userId}`);
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '查询用户失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '查询用户失败。', true);
     } finally {
       setLoading('');
     }
@@ -173,8 +235,8 @@ export default function App() {
       const result = await api.fetchFromX();
       showToast(`已从 API 导入 ${result.imported} 条推文。`);
       await refresh();
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '从 X 拉取推文失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '从 X 拉取推文失败。', true);
     } finally {
       setLoading('');
     }
@@ -186,10 +248,24 @@ export default function App() {
       const result = await api.importArchive(file);
       showToast(`已从归档导入 ${result.imported} 条推文。`);
       await refresh();
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '导入归档失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '导入归档失败。', true);
     } finally {
       setLoading('');
+    }
+  };
+
+  const importArchiveFromDevice = async () => {
+    try {
+      const file = await pickArchiveFile();
+      if (!file) {
+        showToast('当前平台不支持原生归档选择。', true);
+        return;
+      }
+
+      await importArchive(file);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '选择归档失败。', true);
     }
   };
 
@@ -197,9 +273,9 @@ export default function App() {
     setLoading('bsky');
     try {
       const result = await api.testBskyLogin();
-      showToast(`Bluesky 登录成功：@${result.handle}`);
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : 'Bluesky 登录失败。', true);
+      showToast(`Bluesky 登录成功：${result.handle}`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Bluesky 登录失败。', true);
     } finally {
       setLoading('');
     }
@@ -214,8 +290,8 @@ export default function App() {
       const result = await api.startSync();
       showToast(result.message);
       await refresh();
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '启动同步失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '启动同步失败。', true);
     } finally {
       setLoading('');
     }
@@ -225,8 +301,8 @@ export default function App() {
     try {
       await api.pauseSync();
       await refresh();
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '暂停同步失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '暂停同步失败。', true);
     }
   };
 
@@ -234,18 +310,21 @@ export default function App() {
     try {
       await api.resumeSync();
       await refresh();
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '继续同步失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '继续同步失败。', true);
     }
   };
 
   const stopSync = async () => {
     try {
       await api.stopSync();
+      if (mobileMode) {
+        await stopBackgroundSyncMonitor();
+      }
       showToast('已请求停止同步。');
       await refresh();
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '停止同步失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '停止同步失败。', true);
     }
   };
 
@@ -254,8 +333,8 @@ export default function App() {
       const result = await api.resetFailed();
       showToast(`已重置 ${result.reset} 条失败记录。`);
       await refresh();
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '重置失败记录失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '重置失败记录失败。', true);
     }
   };
 
@@ -268,37 +347,85 @@ export default function App() {
       await api.clearTweets();
       showToast('已清空所有推文记录。');
       await refresh();
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : '清空推文失败。', true);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '清空推文失败。', true);
     }
   };
 
+  const clearLocalCredentials = async () => {
+    if (!window.confirm('确定要清除当前设备里的账号凭证和本地登录信息吗？')) {
+      return;
+    }
+
+    try {
+      await api.clearLocalCredentials();
+      setConfig((current) => ({
+        ...current,
+        xBearerToken: '',
+        xUserId: '',
+        bskyHandle: '',
+        bskyAppPassword: '',
+      }));
+      showToast('本地凭证已清除。');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '清除本地凭证失败。', true);
+    }
+  };
+
+  if (!bootReady) {
+    return (
+      <div className="mobile-gate">
+        <div className="mobile-gate-card">
+          <p className="eyebrow">Mobile Boot</p>
+          <h1>正在准备移动控制台</h1>
+          <p className="subtitle">正在恢复本地数据并初始化应用环境。</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="app">
+    <div className={`app ${mobileMode ? 'mobile-mode' : ''}`}>
       <header className="header">
         <div>
-          <p className="eyebrow">Migration Console</p>
+          <p className="eyebrow">{mobileMode ? 'Android Migration Console' : 'Migration Console'}</p>
           <h1>
             X <span>to</span> Bluesky
           </h1>
-          <p className="subtitle">把你的推文历史迁移到 Bluesky，并在一个面板里管理导入、同步和回放进度。</p>
+          <p className="subtitle">把你的推文历史迁移到 Bluesky，并在一个面板里管理导入、同步和进度回放。</p>
         </div>
 
-        <div className="header-status">
-          {engine.running ? (
-            <span className={`badge ${engine.paused ? 'paused' : 'running'}`}>
-              <span className="dot" />
-              {engine.paused ? '同步已暂停' : '同步进行中'}
-              {engine.currentTweetId ? ` · ${engine.currentTweetId}` : ''}
-            </span>
-          ) : (
-            <span className="badge">等待开始</span>
-          )}
+        <div className="header-actions">
+          <div className="header-status">
+            {engine.running ? (
+              <span className={`badge ${engine.paused ? 'paused' : 'running'}`}>
+                <span className="dot" />
+                {engine.paused ? '同步已暂停' : '同步进行中'}
+                {engine.currentTweetId ? ` · ${engine.currentTweetId}` : ''}
+              </span>
+            ) : (
+              <span className="badge">等待开始</span>
+            )}
+          </div>
         </div>
       </header>
 
       <div className="grid">
         <aside>
+          {embeddedMode && (
+            <section className="panel">
+              <h2>本地运行模式</h2>
+              <p className="hint">
+                当前安卓应用正在设备内直接保存数据、运行同步逻辑并调用 X / Bluesky，不依赖你额外部署的后端服务。
+              </p>
+              <div className="runtime-chip-row">
+                <span className="runtime-chip">Single APK</span>
+                <span className="runtime-chip">Local Store</span>
+                <span className="runtime-chip">Native HTTP</span>
+              </div>
+            </section>
+          )}
+
           <section className="panel">
             <h2>X 数据源</h2>
 
@@ -308,7 +435,7 @@ export default function App() {
                 type="password"
                 placeholder="X API v2 Bearer Token"
                 value={config.xBearerToken}
-                onChange={(e) => setConfig({ ...config, xBearerToken: e.target.value })}
+                onChange={(event) => setConfig({ ...config, xBearerToken: event.target.value })}
               />
             </div>
 
@@ -317,27 +444,27 @@ export default function App() {
               <input
                 placeholder="数字用户 ID"
                 value={config.xUserId}
-                onChange={(e) => setConfig({ ...config, xUserId: e.target.value })}
+                onChange={(event) => setConfig({ ...config, xUserId: event.target.value })}
               />
             </div>
 
             <div className="field">
-              <label>通过用户名查找 User ID</label>
+              <label>通过用户名查询 User ID</label>
               <div className="field-row">
-                <input placeholder="@username" value={xUsername} onChange={(e) => setXUsername(e.target.value)} />
-                <button type="button" className="btn-secondary" onClick={lookupUser} disabled={!!loading}>
+                <input placeholder="@username" value={xUsername} onChange={(event) => setXUsername(event.target.value)} />
+                <button type="button" className="btn-secondary" onClick={lookupUser} disabled={Boolean(loading)}>
                   查询
                 </button>
               </div>
             </div>
 
             <div className="btn-group">
-              <button type="button" className="btn-primary" onClick={fetchX} disabled={!!loading || engine.running}>
+              <button type="button" className="btn-primary" onClick={fetchX} disabled={Boolean(loading) || engine.running}>
                 从 API 导入
               </button>
             </div>
 
-            <p className="hint">X API 免费额度通常只能获取最近约 3200 条推文，完整历史更推荐用官方归档导入。</p>
+            <p className="hint">X API 免费额度通常只能获取最近约 3200 条推文，完整历史更推荐使用官方归档导入。</p>
 
             <div className="divider" />
 
@@ -346,18 +473,29 @@ export default function App() {
               <input
                 type="file"
                 accept=".zip,.json"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
                   if (file) {
                     void importArchive(file);
                   }
-                  e.target.value = '';
+                  event.target.value = '';
                 }}
               />
               点击选择，或把官方导出文件拖到这里
             </label>
+
+            {mobileMode && (
+              <div className="btn-group top-gap">
+                <button type="button" className="btn-secondary" onClick={() => void importArchiveFromDevice()} disabled={loading === 'import'}>
+                  从手机文件导入
+                </button>
+              </div>
+            )}
+
             <p className="hint">
-              路径参考：X 设置 → 你的账户 → 下载数据归档。上传官方 `.zip`，或解包后的 `tweets.json` / `tweets.js`。
+              路径参考：X 设置 -&gt; 你的账户 -&gt; 下载数据归档。上传官方 <code>.zip</code>，或解包后的
+              <code> tweets.json </code>
+              /<code> tweets.js </code>。
             </p>
           </section>
 
@@ -369,7 +507,7 @@ export default function App() {
               <input
                 placeholder="name.bsky.social"
                 value={config.bskyHandle}
-                onChange={(e) => setConfig({ ...config, bskyHandle: e.target.value })}
+                onChange={(event) => setConfig({ ...config, bskyHandle: event.target.value })}
               />
             </div>
 
@@ -379,18 +517,26 @@ export default function App() {
                 type="password"
                 placeholder="在 Bluesky 设置里创建的应用密码"
                 value={config.bskyAppPassword}
-                onChange={(e) => setConfig({ ...config, bskyAppPassword: e.target.value })}
+                onChange={(event) => setConfig({ ...config, bskyAppPassword: event.target.value })}
               />
             </div>
 
             <div className="btn-group">
-              <button type="button" className="btn-secondary" onClick={testBsky} disabled={!!loading || !configLoaded}>
+              <button type="button" className="btn-secondary" onClick={testBsky} disabled={Boolean(loading) || !configLoaded}>
                 测试登录
               </button>
-              <button type="button" className="btn-primary" onClick={saveConfig} disabled={!!loading || !configLoaded}>
+              <button type="button" className="btn-primary" onClick={() => void saveConfig()} disabled={Boolean(loading) || !configLoaded}>
                 保存配置
               </button>
             </div>
+
+            {embeddedMode && (
+              <div className="btn-group">
+                <button type="button" className="btn-danger" onClick={() => void clearLocalCredentials()}>
+                  清除本地凭证
+                </button>
+              </div>
+            )}
           </section>
 
           <section className="panel stack-gap">
@@ -400,7 +546,7 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={settings.skipRetweets}
-                onChange={(e) => setSettings({ ...settings, skipRetweets: e.target.checked })}
+                onChange={(event) => setSettings({ ...settings, skipRetweets: event.target.checked })}
               />
               跳过转推
             </label>
@@ -409,7 +555,7 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={settings.skipReplies}
-                onChange={(e) => setSettings({ ...settings, skipReplies: e.target.checked })}
+                onChange={(event) => setSettings({ ...settings, skipReplies: event.target.checked })}
               />
               跳过回复
             </label>
@@ -418,18 +564,18 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={settings.dryRun}
-                onChange={(e) => setSettings({ ...settings, dryRun: e.target.checked })}
+                onChange={(event) => setSettings({ ...settings, dryRun: event.target.checked })}
               />
-              试运行，不真正发帖
+              试运行，不真正发布
             </label>
 
             <label className="checkbox-row">
               <input
                 type="checkbox"
                 checked={settings.addSourceTag}
-                onChange={(e) => setSettings({ ...settings, addSourceTag: e.target.checked })}
+                onChange={(event) => setSettings({ ...settings, addSourceTag: event.target.checked })}
               />
-              在文末加上来源标记
+              在文末添加来源标记
             </label>
 
             <div className="field">
@@ -439,7 +585,9 @@ export default function App() {
                 min={1000}
                 step={500}
                 value={settings.delayMs}
-                onChange={(e) => setSettings({ ...settings, delayMs: Math.max(0, Number(e.target.value) || 0) })}
+                onChange={(event) =>
+                  setSettings({ ...settings, delayMs: Math.max(0, Number(event.target.value) || 0) })
+                }
               />
             </div>
           </section>
@@ -483,35 +631,30 @@ export default function App() {
 
             <div className="btn-group">
               {!engine.running ? (
-                <button
-                  type="button"
-                  className="btn-primary"
-                  onClick={startSync}
-                  disabled={!!loading || stats.pending === 0}
-                >
+                <button type="button" className="btn-primary" onClick={() => void startSync()} disabled={Boolean(loading) || stats.pending === 0}>
                   开始同步
                 </button>
               ) : engine.paused ? (
-                <button type="button" className="btn-success" onClick={resumeSync}>
+                <button type="button" className="btn-success" onClick={() => void resumeSync()}>
                   继续
                 </button>
               ) : (
-                <button type="button" className="btn-secondary" onClick={pauseSync}>
+                <button type="button" className="btn-secondary" onClick={() => void pauseSync()}>
                   暂停
                 </button>
               )}
 
               {engine.running && (
-                <button type="button" className="btn-danger" onClick={stopSync}>
+                <button type="button" className="btn-danger" onClick={() => void stopSync()}>
                   停止
                 </button>
               )}
 
-              <button type="button" className="btn-secondary" onClick={resetFailed} disabled={!!loading}>
+              <button type="button" className="btn-secondary" onClick={() => void resetFailed()} disabled={Boolean(loading)}>
                 重试失败项
               </button>
 
-              <button type="button" className="btn-danger" onClick={clearTweets} disabled={engine.running}>
+              <button type="button" className="btn-danger" onClick={() => void clearTweets()} disabled={engine.running}>
                 清空数据
               </button>
             </div>
@@ -519,7 +662,7 @@ export default function App() {
             <div className="divider" />
 
             <div className="toolbar">
-              <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value as TweetStatus | '')}>
+              <select value={filterStatus} onChange={(event) => setFilterStatus(event.target.value as TweetStatus | '')}>
                 <option value="">全部状态</option>
                 <option value="pending">待同步</option>
                 <option value="syncing">同步中</option>
@@ -532,7 +675,7 @@ export default function App() {
                 type="search"
                 placeholder="搜索推文内容"
                 value={search}
-                onChange={(e) => setSearch(e.target.value)}
+                onChange={(event) => setSearch(event.target.value)}
               />
 
               <span className="toolbar-meta">共 {tweetTotal} 条</span>

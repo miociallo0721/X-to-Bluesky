@@ -9,11 +9,18 @@
     "dev:client": "npm run dev --workspace=client",
     "test": "npm run test --workspace=server",
     "build": "npm run build --workspace=server && npm run build --workspace=client",
-    "start": "npm run start --workspace=server"
+    "start": "npm run start --workspace=server",
+    "mobile:sync": "npm run sync --workspace=mobile",
+    "mobile:android": "npm run open:android --workspace=mobile",
+    "mobile:build:debug": "npm run build:android:debug --workspace=mobile",
+    "mobile:build:release": "npm run build:android:release --workspace=mobile",
+    "mobile:bundle:release": "npm run bundle:android:release --workspace=mobile"
   },
   "workspaces": [
     "server",
-    "client"
+    "client",
+    "mobile",
+    "packages/*"
   ],
   "devDependencies": {
     "concurrently": "^9.1.2"

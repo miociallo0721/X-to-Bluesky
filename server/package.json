@@ -4,9 +4,11 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "prebuild": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "tsc",
+    "pretest": "node -e \"require('node:fs').rmSync('dist-test',{recursive:true,force:true})\"",
     "test": "tsc -p tsconfig.test.json && node --test \"dist-test/**/*.test.js\"",
-    "start": "node dist/index.js"
+    "start": "node dist/server/src/index.js"
   },
   "dependencies": {
     "@atproto/api": "^0.14.12",

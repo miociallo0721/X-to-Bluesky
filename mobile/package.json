@@ -1,0 +1,19 @@
+{
+  "name": "mobile",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:web": "npm run build --workspace=client",
+    "sync": "npm run build:web && cap sync android",
+    "open:android": "cap open android",
+    "build:android:debug": "npm run sync && cd android && gradlew.bat assembleDebug",
+    "build:android:release": "npm run sync && cd android && gradlew.bat assembleRelease",
+    "bundle:android:release": "npm run sync && cd android && gradlew.bat bundleRelease"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^8.3.4",
+    "@capacitor/cli": "^8.3.4",
+    "@capacitor/core": "^8.3.4"
+  }
+}
